@@ -2,10 +2,18 @@
 
 # omarchy:summary=Update AUR packages if any are installed
 
+ignore_args=(--ignore gcc14 --ignore gcc14-libs)
+if [[ -n ${OMARCHY_UPDATE_IGNORE_AUR:-} ]]; then
+  IFS=',' read -ra ignored_packages <<<"$OMARCHY_UPDATE_IGNORE_AUR"
+  for package in "${ignored_packages[@]}"; do
+    [[ -n $package ]] && ignore_args+=(--ignore "$package")
+  done
+fi
+
 if pacman -Qem >/dev/null; then
   if omarchy-pkg-aur-accessible; then
     echo -e "\e[32m\nUpdate AUR packages\e[0m"
-    yay -Sua --noconfirm --cleanafter --ignore gcc14,gcc14-libs
+    yay -Sua --noconfirm --cleanafter "${ignore_args[@]}"
     echo
   else
     echo -e "\e[31m\nAUR is unavailable (so skipping updates)\e[0m"

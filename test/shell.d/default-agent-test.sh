@@ -61,6 +61,10 @@ if [[ $1 == "where" ]]; then
   exit
 fi
 
+if [[ $1 == "current" ]]; then
+  exit 1
+fi
+
 [[ ${OMARCHY_TEST_MISE_FAIL:-false} != "true" ]]
 SH
 
@@ -108,7 +112,7 @@ assert_lazy_stub() {
   "$test_home/.local/bin/$command" --version
   mapfile -t mise_calls <"$mise_history"
 
-  [[ ${mise_calls[0]} == "use -g --quiet $package" && ${mise_calls[1]} == "x $package -- $command --version" ]] ||
+  [[ ${mise_calls[0]} == "current $package" && ${mise_calls[1]} == "use -g --quiet $package" && ${mise_calls[2]} == "exec -- $command --version" ]] ||
     fail "$command lazy stub preserves its mise package"
 }
 

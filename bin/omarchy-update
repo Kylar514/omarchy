@@ -1,11 +1,27 @@
 #!/bin/bash
 
-# omarchy:summary=Update Omarchy and system packages
+# omarchy:summary=Select and install Omarchy, Arch, AUR, and mise updates
 # omarchy:args=[-y]
 # omarchy:examples=omarchy update | omarchy update -y
 # omarchy:requires-sudo=true
 
 set -e
+
+# Sibling helpers live beside this script. An installed system already has
+# this directory on PATH, and test stubs may deliberately shadow it; only a
+# bare checkout lacks this release's helpers, and that is the one case where
+# PATH must grow. The newest helper is the honest probe for that.
+bin_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+command -v omarchy-update-plan >/dev/null 2>&1 || export PATH="$bin_dir:$PATH"
+
+plan_file=""
+sudo_keepalive_pid=""
+
+cleanup() {
+  omarchy-update-stay-awake stop
+  [[ -z $sudo_keepalive_pid ]] || kill "$sudo_keepalive_pid" 2>/dev/null || true
+  [[ -z $plan_file ]] || rm -f "$plan_file"
+}
 
 if [[ -z ${OMARCHY_UPDATE_LOGGED:-} ]]; then
   script_command=$(printf '%q ' "$0" "$@")
@@ -16,16 +32,180 @@ if ! omarchy-update-lock held; then
   exec omarchy-update-lock run "$0" "$@"
 fi
 
-trap 'echo ""; echo -e "\033[0;31mSomething went wrong during the update!\n\nPlease review the output above carefully, correct the error, and retry the update.\n\nIf you need assistance, get help from the community at https://omarchy.org/discord\033[0m"' ERR
-trap 'omarchy-update-stay-awake stop' EXIT
-
-omarchy-update-requires-free-space
+report_update_error() {
+  echo ""
+  echo -e "\033[0;31mSomething went wrong during the update!\n\nPlease review the output above carefully, correct the error, and retry the update.\n\nIf you need assistance, get help from the community at https://omarchy.org/discord\033[0m"
+}
+trap report_update_error ERR
+trap cleanup EXIT
 
 # -y is a promise not to ask anything. Steps that would need an answer report
 # and move on instead of waiting on a prompt nobody is here to give.
 [[ ${1:-} != "-y" ]] || export OMARCHY_UPDATE_UNATTENDED=1
 
-if [[ ${1:-} == "-y" ]] || omarchy-update-confirm; then
+run_arch=1
+run_omarchy=1
+run_aur=1
+run_mise=1
+preflight_done=0
+
+if [[ ${1:-} == "-y" || ( ${OMARCHY_UPDATE_TUI:-0} != 1 && ( ! -t 0 || ! -t 1 ) ) ]]; then
+  omarchy-update-requires-free-space
+  preflight_done=1
+fi
+
+if [[ ${1:-} != "-y" && ( ${OMARCHY_UPDATE_TUI:-0} == 1 || ( -t 0 && -t 1 ) ) ]]; then
+  plan_file=$(mktemp)
+  omarchy-update-plan >"$plan_file"
+
+  # A cancelled or failed selection is reported on its own terms; the ERR trap
+  # must not turn an ordinary quit into a scare.
+  trap - ERR
+  set +e
+  omarchy-update-tui "$plan_file"
+  tui_status=$?
+  set -e
+  trap report_update_error ERR
+  if ((tui_status == 130)); then
+    echo "Update cancelled"
+    exit 0
+  elif ((tui_status != 0)); then
+    echo "Update selection failed" >&2
+    exit "$tui_status"
+  fi
+
+  category_selected() {
+    jq -e --arg id "$1" '.categories[] | select(.id == $id) | .selected' "$plan_file" >/dev/null
+  }
+  category_selected arch || run_arch=0
+  category_selected omarchy || run_omarchy=0
+  category_selected aur || run_aur=0
+  category_selected mise || run_mise=0
+
+  ignored_for() {
+    local manager=$1
+    jq -r --arg manager "$manager" '
+      .categories[] as $category |
+      $category.packages[] |
+      select(.manager == $manager) |
+      select(($category.selected | not) or (.selected | not) or (.target != "latest" and .target != .available)) |
+      .name
+    ' "$plan_file" | paste -sd, -
+  }
+  export OMARCHY_UPDATE_IGNORE_REPO=$(ignored_for repo)
+  export OMARCHY_UPDATE_IGNORE_AUR=$(ignored_for aur)
+  export OMARCHY_UPDATE_IGNORE_MISE=$(ignored_for mise)
+
+  repo_customized=$(jq -r '
+    ([.categories[] | select(.id == "arch" or .id == "omarchy") | .selected] | all) and
+    ([.categories[] | select(.id == "arch" or .id == "omarchy") | .packages[] | (.selected and (.target == "latest" or .target == .available))] | all) |
+    not
+  ' "$plan_file")
+  if [[ $repo_customized == true ]]; then
+    repo_allowed=$(jq -r '
+      .categories[] | select((.id == "arch" or .id == "omarchy") and .selected) |
+      .packages[] | select(.selected and (.target == "latest" or .target == .available)) | .name
+    ' "$plan_file")
+    repo_ignored=$(while read -r package; do grep -qxF "$package" <<<"$repo_allowed" || echo "$package"; done < <(pacman -Qnq))
+    OMARCHY_UPDATE_IGNORE_REPO=$(printf '%s\n%s\n' "$OMARCHY_UPDATE_IGNORE_REPO" "$repo_ignored" | awk 'NF && !seen[$0]++' | paste -sd, -)
+    export OMARCHY_UPDATE_IGNORE_REPO
+  fi
+
+  aur_customized=$(jq -r '
+    (.categories[] | select(.id == "aur")) |
+    ((.selected and ([.packages[] | (.selected and (.target == "latest" or .target == .available))] | all)) | not)
+  ' "$plan_file")
+  if [[ $aur_customized == true ]]; then
+    aur_allowed=$(jq -r '.categories[] | select(.id == "aur" and .selected) | .packages[] | select(.selected and (.target == "latest" or .target == .available)) | .name' "$plan_file")
+    aur_ignored=$(while read -r package; do grep -qxF "$package" <<<"$aur_allowed" || echo "$package"; done < <(pacman -Qmq))
+    OMARCHY_UPDATE_IGNORE_AUR=$(printf '%s\n%s\n' "$OMARCHY_UPDATE_IGNORE_AUR" "$aur_ignored" | awk 'NF && !seen[$0]++' | paste -sd, -)
+    export OMARCHY_UPDATE_IGNORE_AUR
+  fi
+
+  mise_customized=$(jq -r '
+    (.categories[] | select(.id == "mise")) |
+    ((.selected and ([.packages[] | (.selected and .target == "latest")] | all)) | not)
+  ' "$plan_file")
+  if [[ $mise_customized == true ]] && omarchy-cmd-present mise; then
+    mise_allowed=$(jq -r '.categories[] | select(.id == "mise" and .selected) | .packages[] | select(.selected and .target == "latest") | .name' "$plan_file")
+    mise_ignored=$(mise ls --json | jq -r 'keys[]' | while read -r tool; do grep -qxF "$tool" <<<"$mise_allowed" || echo "$tool"; done)
+    OMARCHY_UPDATE_IGNORE_MISE=$(printf '%s\n%s\n' "$OMARCHY_UPDATE_IGNORE_MISE" "$mise_ignored" | awk 'NF && !seen[$0]++' | paste -sd, -)
+    export OMARCHY_UPDATE_IGNORE_MISE
+  fi
+
+  planned_retention=$(jq -r '.snapshots // empty' "$plan_file")
+  pending_count=$(jq '[.categories[].packages[]] | length' "$plan_file")
+  if ((pending_count > 0 && (run_arch || run_omarchy || run_aur))) || [[ -n $planned_retention ]] || ! cmp -s <(jq -S .originalPins "$plan_file") <(jq -S .pins "$plan_file"); then
+    sudo -v
+    while true; do sudo -n true; sleep 60; done 2>/dev/null &
+    sudo_keepalive_pid=$!
+  fi
+
+  if ! cmp -s <(jq -S .originalPins "$plan_file") <(jq -S .pins "$plan_file"); then
+    pins=$(mktemp)
+    jq '.pins' "$plan_file" >"$pins"
+    omarchy-update-pin apply "$pins"
+    rm -f "$pins"
+  fi
+
+  if [[ -n $planned_retention ]]; then
+    current_retention=$(awk -F= '$1 == "NUMBER_LIMIT" {gsub(/"/, "", $2); gsub(/ /, "", $2); print $2}' \
+      /etc/snapper/configs/root 2>/dev/null | tail -n 1)
+    if [[ $current_retention != "$planned_retention" ]]; then
+      omarchy-snapshot retention "$planned_retention"
+    fi
+  fi
+
+  # The selector opens even with nothing pending, so retention and held
+  # versions stay reachable. An accepted empty plan closes here, after any
+  # staged retention above was applied.
+  if ((pending_count == 0)); then
+    echo "System is up to date."
+    held=$(jq -r '.pins | to_entries[] | "  \(.key)=\(.value.version)"' "$plan_file")
+    if [[ -n $held ]]; then
+      echo
+      echo "Held versions (resume updates with: omarchy update pin latest <package>):"
+      printf '%s\n' "$held"
+    fi
+    exit 0
+  fi
+elif [[ ${1:-} != "-y" ]] && ! omarchy-update-confirm; then
+  exit 0
+else
+  pins_file=${OMARCHY_UPDATE_PINS_FILE:-/etc/omarchy/update-pins.json}
+  if [[ -r $pins_file ]]; then
+    pinned=$(jq -r 'keys[]' "$pins_file" 2>/dev/null | paste -sd, -)
+    export OMARCHY_UPDATE_IGNORE_REPO=$pinned
+    export OMARCHY_UPDATE_IGNORE_AUR=$pinned
+  fi
+fi
+
+# Name what runs before anything does, so a deliberate skip is announced
+# rather than reading as a phase that went missing. An accepted plan that
+# selected nothing at all closes here without touching the system.
+phases=()
+skipped=()
+((run_arch)) && phases+=(Arch) || skipped+=(Arch)
+((run_omarchy)) && phases+=(Omarchy) || skipped+=(Omarchy)
+((run_aur)) && phases+=(AUR) || skipped+=(AUR)
+((run_mise)) && phases+=("mise tools") || skipped+=("mise tools")
+
+if ((${#phases[@]} == 0)); then
+  echo "Nothing selected to update."
+  exit 0
+fi
+
+echo -e "\e[32mUpdating: ${phases[*]}\e[0m"
+if ((${#skipped[@]})); then
+  echo "Skipped this run: ${skipped[*]}"
+fi
+echo
+
+if ((run_arch || run_omarchy || run_aur)); then
+  if ((!preflight_done)); then
+    omarchy-update-requires-free-space
+  fi
+
   # Before the snapshot: the cache is on the snapshotted subvolume, so pruning
   # after it frees nothing until that snapshot ages out.
   omarchy-update-pkg-prune
@@ -37,19 +217,35 @@ if [[ ${1:-} == "-y" ]] || omarchy-update-confirm; then
     echo -e "\e[33mContinuing the update without a snapshot.\e[0m" >&2
 
   omarchy-update-stay-awake start
+fi
 
-  omarchy-update-dev
-  omarchy-update-keyring
+if ((run_arch || run_omarchy || run_aur || run_mise)); then
+  if ((run_arch || run_omarchy)); then
+    omarchy-update-dev
+    omarchy-update-keyring
 
-  # Migrations ship with the packages installed here and are written against
-  # them, so everything below waits on this finishing. An upgrade that stopped
-  # takes the update with it rather than migrating against what is still on disk.
-  omarchy-update-system-pkgs
-  omarchy-migrate
-  omarchy-hook post-update
-  omarchy-update-aur-pkgs
-  omarchy-update-mise
-  omarchy-update-orphan-pkgs
+    # Migrations ship with the packages installed here and are written against
+    # them, so everything below waits on this finishing. An upgrade that stopped
+    # takes the update with it rather than migrating against what is still on disk.
+    omarchy-update-system-pkgs
+    [[ -z $plan_file ]] || omarchy-update-targets "$plan_file" repo
+  fi
+  if ((run_omarchy)); then
+    omarchy-migrate
+    omarchy-hook post-update
+  fi
+  if ((run_aur)); then
+    omarchy-update-aur-pkgs
+    [[ -z $plan_file ]] || omarchy-update-targets "$plan_file" aur
+  fi
+  if ((run_mise)); then
+    omarchy-update-mise
+    [[ -z $plan_file ]] || omarchy-update-targets "$plan_file" mise
+  fi
+
+  if ((run_arch || run_omarchy || run_aur)); then
+    omarchy-update-orphan-pkgs
+  fi
 
   omarchy-update-analyze-logs
   omarchy-update-status
@@ -60,5 +256,9 @@ if [[ ${1:-} == "-y" ]] || omarchy-update-confirm; then
   omarchy-update-stay-awake stop
   trap - EXIT
 
-  omarchy-update-restart
+  [[ -z $sudo_keepalive_pid ]] || kill "$sudo_keepalive_pid" 2>/dev/null || true
+  [[ -z $plan_file ]] || rm -f "$plan_file"
+  if ((run_arch || run_omarchy)); then
+    omarchy-update-restart
+  fi
 fi

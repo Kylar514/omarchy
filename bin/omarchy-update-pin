@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# omarchy:summary=List and manage persistent package version targets
+# omarchy:args=[list|set <package> <version> <manager>|latest <package>|apply <json-file>]
+# omarchy:examples=omarchy update pin list | omarchy update pin set remote-desktop-manager 2026.2.2.2-2 aur
+# omarchy:requires-sudo=true
+
+set -euo pipefail
+
+pins_file=${OMARCHY_UPDATE_PINS_FILE:-/etc/omarchy/update-pins.json}
+command=${1:-list}
+
+read_pins() {
+  if [[ -r $pins_file ]] && jq -e 'type == "object"' "$pins_file" >/dev/null 2>&1; then
+    jq . "$pins_file"
+  else
+    printf '{}\n'
+  fi
+}
+
+write_pins() {
+  local source=$1
+  jq -e 'type == "object"' "$source" >/dev/null
+
+  if [[ -n ${OMARCHY_UPDATE_PINS_FILE:-} ]]; then
+    mkdir -p "${pins_file%/*}"
+    install -m 0644 "$source" "$pins_file"
+  else
+    sudo install -d -m 0755 /etc/omarchy
+    sudo install -m 0644 "$source" "$pins_file"
+  fi
+}
+
+validate_package() {
+  [[ $1 =~ ^[a-zA-Z0-9@._+-]+$ ]] || {
+    echo "Invalid package name: $1" >&2
+    exit 1
+  }
+}
+
+case $command in
+  list)
+    read_pins | jq -r 'to_entries[] | "\(.key)\t\(.value.version)\t\(.value.manager)"'
+    ;;
+  set)
+    package=${2:?usage: omarchy update pin set <package> <version> <manager>}
+    version=${3:?}
+    manager=${4:?}
+    validate_package "$package"
+    [[ $manager == "repo" || $manager == "aur" ]] || {
+      echo "Pins are supported for repository and AUR packages" >&2
+      exit 1
+    }
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    read_pins | jq --arg package "$package" --arg version "$version" --arg manager "$manager" \
+      '.[$package] = {version: $version, manager: $manager, kind: "installed", locator: ""}' >"$tmp"
+    write_pins "$tmp"
+    ;;
+  latest)
+    package=${2:?usage: omarchy update pin latest <package>}
+    validate_package "$package"
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    read_pins | jq --arg package "$package" 'del(.[$package])' >"$tmp"
+    write_pins "$tmp"
+    ;;
+  apply)
+    source=${2:?usage: omarchy update pin apply <json-file>}
+    write_pins "$source"
+    ;;
+  *)
+    echo "Usage: omarchy update pin [list|set <package> <version> <manager>|latest <package>|apply <json-file>]" >&2
+    exit 1
+    ;;
+esac

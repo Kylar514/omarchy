@@ -16,6 +16,7 @@ steps=(
   omarchy-update-lock
   omarchy-update-requires-free-space
   omarchy-update-confirm
+  omarchy-update-plan
   omarchy-update-pkg-prune
   omarchy-snapshot
   omarchy-update-stay-awake

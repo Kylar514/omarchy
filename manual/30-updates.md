@@ -1,12 +1,36 @@
 # Updates
 
-Omarchy and your packages are kept up to date via _Update > Omarchy_ in the Omarchy menu (`Super + Space`).
+Omarchy and your packages are kept up to date via _Update > Omarchy_ in the Omarchy menu (`Super + Space`). The update opens with every category and package selected, so pressing `Enter` immediately performs the normal full update.
 
 Omarchy itself is installed as regular pacman packages from the [Omarchy Package Repository](https://github.com/omacom-io/omarchy-pkgs), so an update installs [the latest Omarchy release](https://github.com/basecamp/omarchy/releases), runs any pending migrations to get your system in sync with the latest, and updates all system packages from the [Omarchy Arch Mirror](https://github.com/omacom-io/omarchy-mirror) and [AUR](https://aur.archlinux.org/) (if you have installed any AUR packages).
 
 When new releases are made, a circle arrow icon will appear to the right of your clock. Click it and the update process will start.
 
 ![update-available](images/update-available.webp)
+
+### Selecting updates
+
+The update screen separates pending Arch, Omarchy, AUR, and mise updates. Use `j`/`k` or the arrow keys to move, `Space` or `Tab` to include or skip an item for this run, `l`/`Right`/`Enter` to open an item, and `h`/`Left`/`Backspace` to return to the previous screen without losing your selections.
+
+Pressing `Enter` on an unchanged plan starts the full update immediately. If you changed anything, a summary screen first lists exactly what will run, what is skipped, and which versions are targeted, alongside the standing update warnings. `Enter` on that screen starts the update; `h` returns to the selector with your choices intact.
+
+Skipping a package is temporary. It starts selected again the next time you update and continues tracking the latest version.
+
+Selecting either the Arch or Omarchy category without the other is an advanced partial repository update. Omarchy still asks pacman to validate the transaction and never bypasses dependencies, but holding repository packages can leave an unsupported combination of versions. The update stops if pacman cannot satisfy the selected plan.
+
+The complete plan is built before asking for your password. Browsing updates and cancelling require no privilege, and a mise-only update does not ask for a system password.
+
+With nothing pending, the update reports that the system is up to date and names any held versions with the command that resumes them, instead of opening an empty selector.
+
+### Package versions
+
+Open a package to choose `latest` or an exact available version. An exact version is a persistent target: future updates keep that package at the chosen version until you select `latest` again. Choosing the installed version therefore holds the package where it is, while choosing an older version stages a downgrade.
+
+Available history depends on the package source. Omarchy can use retained pacman or yay cache files, signed packages from the Arch Linux Archive, historical AUR recipes, and versions published by a mise backend. A historical AUR recipe is rebuilt locally and may no longer work if its upstream source disappeared. Unavailable versions are not offered as installable targets.
+
+Exact package targets are machine-wide for pacman and AUR packages because those package databases are machine-wide. Mise targets remain in mise's user configuration.
+
+Omarchy never uses `--nodeps` to force a selected version. A downgrade or held version that conflicts with the rest of the selected transaction stops with pacman's dependency error.
 
 ### Four channels
 

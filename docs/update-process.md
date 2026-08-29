@@ -16,6 +16,7 @@ The design goal is:
   DBus/session state, a graphical session, sudo, or user interaction.
 - Users who bypass `omarchy update` are nudged back by the pacman guard; if they
   explicitly bypass it, their session is notified when migrations are pending.
+- Interactive users see and may narrow a staged plan before any privileged operation; the unchanged default is the complete update pipeline.
 
 ## State and coordination files
 
@@ -27,6 +28,43 @@ The design goal is:
 | `~/.local/state/omarchy/migrations/` | user | Per-user migration markers. |
 | `~/.local/state/omarchy/reboot-required` | user | Optional reboot marker checked by `omarchy-update-restart`. |
 | `~/.local/state/omarchy/restart-*-required` | user | Optional service/app restart markers checked by `omarchy-update-restart`. The shell needs no marker: it is restarted unconditionally after every update. |
+| `/etc/omarchy/update-pins.json` | root | Machine-wide exact-version targets selected for repository and AUR packages. Omarchy passes these through its own update transactions rather than rewriting `pacman.conf`. |
+
+## Interactive update plan
+
+In a terminal, `omarchy update` runs `omarchy-update-plan` before the free-space check, snapshot, authentication, or package mutation. The planner uses `checkupdates`, `yay -Qua`, and `mise outdated --json` to produce four groups: Arch repository packages, Omarchy repository packages, AUR packages, and mise tools. A query failure stops planning rather than turning an unknown category into an unrestricted update.
+
+`omarchy-update` resolves its sibling helpers beside itself, extending PATH only when this release's helpers are not already resolvable. A checkout therefore runs standalone with `./bin/omarchy-update`, while installed systems and test stubs keep their own resolution order.
+
+`omarchy-update-tui` edits only a temporary JSON plan. Every category and package starts selected. Category and package checkboxes are one-run state; exact package targets are staged separately and written only after the user activates the update action and sudo authentication succeeds.
+
+An untouched plan is its own confirmation: activating the update action starts immediately. A customized plan first shows an in-selector summary — phase counts, one-run skips, version targets, and the standing update warnings — and only `Enter` on that screen proceeds. Activation happens before authentication, so cancelling never prompts.
+
+With no pending updates, the updater exits after planning: it reports the system is up to date and names held versions with the `omarchy update pin latest` command that resumes them. An empty selector has no rows to manage pins on, so opening one would manage nothing.
+
+The main update action is initially focused, so `Enter` accepts the unchanged full plan. Navigation is Vim-first with arrow-key equivalents: `j`/`k` move, `l`/`Right`/`Enter` open, `h`/`Left`/`Backspace` return, and `Space`/`Tab` toggle one-run selection.
+
+When a repository, AUR, or mise plan is customized, execution becomes a strict allowlist built from the preview. Packages and tools not present in the selected plan are excluded, so an update published between planning and execution is not silently added to that customized transaction. An unchanged full plan retains the normal update-all behavior.
+
+Arch and Omarchy are displayed independently even though both are pacman repositories. Selecting only one is deliberately an advanced partial transaction implemented with validated `--ignore` arguments on the normal `pacman -Syu`; pacman dependency resolution remains authoritative, and Omarchy never supplies `--nodeps` or `--assume-installed` to force it through.
+
+Migrations and `post-update` hooks run only when the Omarchy repository category is selected. A mise-only plan skips the root snapshot, pacman cache pruning, orphan review, sleep inhibitor, and restart checks.
+
+## Exact version targets
+
+`latest` is the default mutable policy. Choosing an exact repository or AUR version stages an entry in `/etc/omarchy/update-pins.json`; choosing `latest` removes it. The entry records the version, manager, candidate kind, and candidate locator so a historical target skipped in one run remains actionable in a later run.
+
+Selectable candidate providers are:
+
+- The currently installed version.
+- Package archives retained in pacman's configured cache directories or yay's package cache.
+- Signed historical Arch packages from the Arch Linux Archive. Both package and detached signature are downloaded, and `pacman-key --verify` must succeed before installation.
+- Historical AUR Git commits. The selected recipe builds without installing, then every output is inspected and only the artifact matching the requested package name and version is installed.
+- Versions returned by `mise ls-remote`, applied through `mise use -g --pin`.
+
+Local and downloaded binary packages are inspected with `pacman -Qp` before `pacman -U`. Pacman performs normal dependency checks for every exact target. A historical AUR recipe remains executable third-party build code, just as its current AUR recipe is, and may fail when old source artifacts are no longer published.
+
+Generated mise wrappers first check whether their tool has an active configured version and only create a `latest` global selection when none exists. They execute through the active mise environment without supplying an unversioned tool override, so selecting an exact historical version is not undone on the tool's next launch.
 
 ## Migration layout
 

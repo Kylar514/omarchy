@@ -1,0 +1,95 @@
+#!/bin/bash
+
+# omarchy:summary=Apply exact package and tool versions selected in an update plan
+# omarchy:args=<plan-file> <repo|aur|mise>
+# omarchy:hidden=true
+
+set -euo pipefail
+
+plan=${1:?usage: omarchy-update-targets <plan-file> <repo|aur|mise>}
+manager=${2:?}
+downloads=$(mktemp -d)
+trap 'rm -rf "$downloads"' EXIT
+
+while IFS=$'\t' read -r name installed target available kind locator; do
+  [[ -n ${name:-} ]] || continue
+
+  if [[ $manager == "mise" ]]; then
+    if [[ $target == "latest" ]]; then
+      # Choosing latest has to lift a stale pin, which mise up alone respects.
+      requested=$(mise ls --json 2>/dev/null |
+        jq -r --arg name "$name" '.[$name][0].requested_version // "latest"')
+      [[ $requested == "latest" ]] && continue
+      echo -e "\e[32m\nSet $name to latest\e[0m"
+      mise use -g "$name@latest"
+      continue
+    fi
+    [[ $target != "$installed" ]] || continue
+    echo -e "\e[32m\nSet $name to $target\e[0m"
+    mise use -g --pin "$name@$target"
+    continue
+  fi
+
+  # The normal repository/AUR phase installs the advertised version. Exact
+  # targets only need separate work when they point somewhere else.
+  [[ $target != "latest" && $target != "$available" ]] || continue
+
+  case $kind in
+    cache)
+      archive=$locator
+      ;;
+    archive)
+      archive="$downloads/${locator##*/}"
+      echo -e "\e[32m\nDownload $name $target\e[0m"
+      curl -fL --output "$archive" "$locator"
+      curl -fL --output "$archive.sig" "$locator.sig"
+      sudo pacman-key --verify "$archive.sig"
+      ;;
+    recipe)
+      recipe_dir="$downloads/$name"
+      echo -e "\e[32m\nBuild $name $target from its historical AUR recipe\e[0m"
+      git clone --quiet "https://aur.archlinux.org/$name.git" "$recipe_dir"
+      git -C "$recipe_dir" checkout --quiet "$locator"
+      (
+        cd "$recipe_dir"
+        makepkg -s --noconfirm --needed
+      )
+      matched=""
+      while read -r built; do
+        [[ -f $built ]] || continue
+        metadata=$(LC_ALL=C pacman -Qp --print-format '%n\t%v' "$built" 2>/dev/null || true)
+        if [[ $metadata == "$name"$'\t'"$target" ]]; then
+          [[ -z $matched ]] || {
+            echo "Historical recipe produced more than one matching package" >&2
+            exit 1
+          }
+          matched=$built
+        fi
+      done < <(cd "$recipe_dir" && makepkg --packagelist)
+      [[ -n $matched ]] || {
+        echo "Historical recipe did not produce $name $target" >&2
+        exit 1
+      }
+      sudo env OMARCHY_UPDATE_PACMAN=1 pacman -U --noconfirm "$matched"
+      continue
+      ;;
+    *)
+      echo "Cannot obtain $name $target; choose an available version" >&2
+      exit 1
+      ;;
+  esac
+
+  metadata=$(LC_ALL=C pacman -Qp --print-format '%n\t%v' "$archive")
+  [[ $metadata == "$name"$'\t'"$target" ]] || {
+    echo "Downloaded package does not match $name $target" >&2
+    exit 1
+  }
+
+  echo -e "\e[32m\nSet $name to $target\e[0m"
+  sudo env OMARCHY_UPDATE_PACMAN=1 pacman -U --noconfirm "$archive"
+done < <(jq -r --arg manager "$manager" '
+  .categories[].packages[] |
+  select(.selected and .manager == $manager) |
+  [.name, .installed, .target, .available, (.candidate.kind // ""), (.candidate.locator // "")] |
+  @tsv
+' "$plan")

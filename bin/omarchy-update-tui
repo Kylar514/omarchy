@@ -1,0 +1,301 @@
+#!/bin/bash
+
+# omarchy:summary=Select packages and tools for an Omarchy update
+# omarchy:args=<plan-file> | --dispatch
+# omarchy:hidden=true
+
+set -euo pipefail
+
+green=2
+muted=8
+
+# One fzf process lives for the whole selection. Key presses are dispatched
+# back into this script (below), which mutates the plan, rewrites the row
+# file, and tells fzf to reload it: no restart, no flash, and the cursor
+# stays on its row across toggles and screen changes.
+
+mutate_plan() {
+  local tmp
+  tmp=$(mktemp)
+  jq "$@" "$OMARCHY_TUI_PLAN" >"$tmp"
+  mv "$tmp" "$OMARCHY_TUI_PLAN"
+}
+
+category_label() {
+  case $1 in
+    arch) printf 'Arch packages' ;;
+    omarchy) printf 'Omarchy packages' ;;
+    aur) printf 'AUR packages' ;;
+    mise) printf 'mise tools' ;;
+  esac
+}
+
+snapper_retention() {
+  local v
+  v=$(awk -F= '$1 == "NUMBER_LIMIT" {gsub(/"/, "", $2); gsub(/ /, "", $2); print $2}' \
+    /etc/snapper/configs/root 2>/dev/null | tail -n 1)
+  printf '%s' "${v:-5}"
+}
+
+staged_retention() {
+  jq -r '.snapshots // empty' "$OMARCHY_TUI_PLAN" 2>/dev/null || true
+}
+
+main_rows() {
+  printf 'run\tUpdate selected packages\n'
+  jq -r '.categories[] | [.id, (if .selected then "[x]" else "[ ]" end), (.label + (" " * ([(17 - (.label | length)), 0] | max))), (([.packages[] | select(.selected)] | length) | tostring) + "/" + ((.packages | length) | tostring)] | @tsv' "$OMARCHY_TUI_PLAN"
+  local staged
+  staged=$(staged_retention)
+  if [[ -n $staged ]]; then
+    printf 'snapper\tSnapshots kept: %s -> %s\n' "$(snapper_retention)" "$staged"
+  else
+    printf 'snapper\tSnapshots kept: %s\n' "$(snapper_retention)"
+  fi
+}
+
+retention_rows() {
+  local current staged n marker
+  current=$(snapper_retention)
+  staged=$(staged_retention)
+  for n in 5 10 15 20 25 30; do
+    marker=' '
+    if [[ -z $staged && $n == "$current" || -n $staged && $n == "$staged" ]]; then
+      marker='*'
+    fi
+    printf '%s\t%s\t%s snapshots\n' "$n" "$marker" "$n"
+  done
+}
+
+category_rows() {
+  local id=$1
+  local count
+  count=$(jq -r --arg id "$id" '.categories[] | select(.id == $id) | .packages | length' "$OMARCHY_TUI_PLAN")
+  if ((count == 0)); then
+    printf 'none\t    No updates available\n'
+    return
+  fi
+  jq -r --arg id "$id" '
+    .categories[] | select(.id == $id) | .packages[] |
+    [.name, (if .selected then "[x]" else "[ ]" end), .name, (.installed + " -> " + .available), (if .target == "latest" then "latest" else "pin " + .target end)] | @tsv
+  ' "$OMARCHY_TUI_PLAN"
+}
+
+version_rows() {
+  local id=$1 name=$2
+  local manager installed available source
+  IFS=$'\t' read -r manager installed available source <<<"$(jq -r --arg id "$id" --arg name "$name" '
+    .categories[] | select(.id == $id) | .packages[] | select(.name == $name) |
+    [.manager, .installed, .available, .source] | @tsv
+  ' "$OMARCHY_TUI_PLAN")"
+  local target
+  target=$(jq -r --arg id "$id" --arg name "$name" '
+    .categories[] | select(.id == $id) | .packages[] | select(.name == $name) | .target
+  ' "$OMARCHY_TUI_PLAN")
+
+  omarchy-update-versions "$manager" "$name" "$installed" "$available" "$source" |
+    jq -r --arg target "$target" --arg available "$available" '
+      .[] |
+      [
+        .version,
+        (if .version == $target then "*" else " " end),
+        (if .version == "latest" then "latest (" + $available + ")" else .version end),
+        (if .kind == "installed" then "installed" elif .kind == "available" then "available" elif .kind == "cache" then "cached binary" elif .kind == "archive" then "signed archive" elif .kind == "recipe" then "historical recipe" elif .kind == "mise" then "mise release" else "tracks newest release" end),
+        .locator
+      ] |
+      @tsv
+    '
+}
+
+# 1-based row number whose first field matches, so a screen can reopen with
+# the cursor on the row the person came from.
+rows_position() {
+  local want=$1 line position=1
+  while IFS= read -r line; do
+    [[ ${line%%$'\t'*} == "$want" ]] && { printf '%s' "$position"; return; }
+    position=$((position + 1))
+  done <"$OMARCHY_TUI_STATE/rows"
+  printf '%s' 1
+}
+
+reload_action() {
+  printf 'reload(cat %s/rows)' "$OMARCHY_TUI_STATE"
+}
+
+apply_version_choice() {
+  local id=$1 name=$2 version=$3 kind=$4 locator=$5
+  mutate_plan \
+    --arg id "$id" \
+    --arg name "$name" \
+    --arg version "$version" \
+    --arg kind "$kind" \
+    --arg locator "$locator" '
+      (.categories[] | select(.id == $id) | .packages[] | select(.name == $name)) |=
+        (.target = $version | .candidate = {version: $version, kind: $kind, locator: $locator}) |
+      if $version == "latest" then del(.pins[$name])
+      elif $id == "mise" then .
+      else .pins[$name] = {
+        version: $version,
+        manager: (.categories[] | select(.id == $id) | .packages[] | select(.name == $name) | .manager),
+        kind: $kind,
+        locator: $locator
+      }
+      end
+    '
+}
+
+if [[ ${1:-} == --dispatch ]]; then
+  plan=$OMARCHY_TUI_PLAN
+  key=${FZF_KEY:-}
+  item=${FZF_CURRENT_ITEM:-}
+  id=${item%%$'\t'*}
+  IFS=$'\t' read -r screen state_a state_b <<<"$(<"$OMARCHY_TUI_STATE/state")"
+
+  back_to_main() {
+    printf 'main\n' >"$OMARCHY_TUI_STATE/state"
+    main_rows >"$OMARCHY_TUI_STATE/rows"
+    printf '%s\n' "$(reload_action)+change-header(Omarchy Update)+change-with-nth(2..)+pos($(rows_position "$1"))"
+  }
+
+  back_to_category() {
+    printf 'category\t%s\n' "$1" >"$OMARCHY_TUI_STATE/state"
+    category_rows "$1" >"$OMARCHY_TUI_STATE/rows"
+    printf '%s\n' "$(reload_action)+change-header($(category_label "$1"))+change-with-nth(2..5)+pos($(rows_position "${2:-}"))"
+  }
+
+  case $screen in
+    main)
+      case $key in
+        space | tab)
+          [[ $id == run ]] && exit 0
+          mutate_plan --arg id "$id" '(.categories[] | select(.id == $id) | .selected) |= not'
+          main_rows >"$OMARCHY_TUI_STATE/rows"
+          reload_action
+          ;;
+        l | right | enter)
+          if [[ $id == run ]]; then
+            # The selection above is the confirmation; start right away.
+            printf 'accept\n'
+          elif [[ $id == snapper ]]; then
+            printf 'snapper\n' >"$OMARCHY_TUI_STATE/state"
+            retention_rows >"$OMARCHY_TUI_STATE/rows"
+            printf '%s\n' "$(reload_action)+change-header(Snapshot retention)+change-with-nth(2..)"
+          else
+            printf 'category\t%s\n' "$id" >"$OMARCHY_TUI_STATE/state"
+            category_rows "$id" >"$OMARCHY_TUI_STATE/rows"
+            printf '%s\n' "$(reload_action)+change-header($(category_label "$id"))+change-with-nth(2..5)"
+          fi
+          ;;
+        q)
+          printf 'abort\n'
+          ;;
+      esac
+      ;;
+    category)
+      case $key in
+        space | tab)
+          [[ $id == none ]] && exit 0
+          mutate_plan --arg id "$state_a" --arg name "$id" \
+            '(.categories[] | select(.id == $id) | .packages[] | select(.name == $name) | .selected) |= not'
+          category_rows "$state_a" >"$OMARCHY_TUI_STATE/rows"
+          reload_action
+          ;;
+        l | right | enter)
+          [[ $id == none ]] && exit 0
+          printf 'version\t%s\t%s\n' "$state_a" "$id" >"$OMARCHY_TUI_STATE/state"
+          local_header="$id  $(jq -r --arg id "$state_a" --arg name "$id" '
+            .categories[] | select(.id == $id) | .packages[] | select(.name == $name) |
+            "installed " + .installed + "  available " + .available
+          ' "$OMARCHY_TUI_PLAN")"
+          version_rows "$state_a" "$id" >"$OMARCHY_TUI_STATE/rows"
+          printf '%s\n' "$(reload_action)+change-header($local_header)+change-with-nth(2..4)"
+          ;;
+        h | left | backspace | q)
+          back_to_main "$state_a"
+          ;;
+      esac
+      ;;
+    snapper)
+      case $key in
+        enter)
+          [[ $id =~ ^[0-9]+$ ]] || exit 0
+          mutate_plan --argjson n "$id" '.snapshots = $n'
+          back_to_main snapper
+          ;;
+        h | left | backspace | q)
+          back_to_main snapper
+          ;;
+      esac
+      ;;
+    version)
+      case $key in
+        enter)
+          IFS=$'\t' read -r version marker display kind locator <<<"$item"
+          [[ -n ${version:-} ]] || exit 0
+          apply_version_choice "$state_a" "$state_b" "$version" "$kind" "$locator"
+          back_to_category "$state_a" "$state_b"
+          ;;
+        h | left | backspace | q)
+          back_to_category "$state_a" "$state_b"
+          ;;
+      esac
+      ;;
+  esac
+  exit 0
+fi
+
+plan=${1:?usage: omarchy-update-tui <plan-file>}
+state_dir=$(mktemp -d)
+trap 'rm -rf "$state_dir"' EXIT
+export OMARCHY_TUI_PLAN=$plan
+export OMARCHY_TUI_STATE=$state_dir
+printf 'main\n' >"$state_dir/state"
+main_rows >"$state_dir/rows"
+
+# The stock confirmation box, minus the yes/no: the selector below is the
+# answer. Enter proceeds, q or esc declines, so nothing here blocks.
+gum style --border normal --padding "1 2" \
+  "$(gum style --bold 'Ready to update?')" \
+  "" \
+  "• You cannot stop the update once you start!" \
+  "• Make sure you're connected to power or have a full battery" \
+  "" \
+  "What's new: https://github.com/basecamp/omarchy/releases/latest"
+echo
+
+script=$(readlink -f "$0")
+dispatch_cmd="env OMARCHY_TUI_PLAN=$plan OMARCHY_TUI_STATE=$state_dir $script --dispatch"
+
+set +e
+fzf \
+  --ansi \
+  --no-input \
+  --layout=reverse \
+  --height=~60% \
+  --border=none \
+  --info=hidden \
+  --prompt='' \
+  --pointer='> ' \
+  --header='Omarchy Update' \
+  --footer='j/k move  l/enter open  h/backspace back  space/tab select  q quit/back  esc quit' \
+  --delimiter=$'\t' \
+  --with-nth=2.. \
+  --color="pointer:$green,marker:$green,header:$green,footer:$muted" \
+  --track \
+  --bind "j:down,k:up" \
+  --bind "space:transform:$dispatch_cmd" \
+  --bind "tab:transform:$dispatch_cmd" \
+  --bind "l:transform:$dispatch_cmd" \
+  --bind "right:transform:$dispatch_cmd" \
+  --bind "enter:transform:$dispatch_cmd" \
+  --bind "h:transform:$dispatch_cmd" \
+  --bind "left:transform:$dispatch_cmd" \
+  --bind "backspace:transform:$dispatch_cmd" \
+  --bind "q:transform:$dispatch_cmd" \
+  <"$state_dir/rows"
+status=$?
+set -e
+
+# accept: the selection is the plan, start the update. 130: cancelled.
+((status == 0)) && exit 0
+((status == 130)) && exit 130
+exit "$status"

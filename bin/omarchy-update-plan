@@ -1,0 +1,163 @@
+#!/bin/bash
+
+# omarchy:summary=Build the package and tool update plan
+# omarchy:hidden=true
+
+set -euo pipefail
+
+if [[ -n ${OMARCHY_UPDATE_PLAN_FIXTURE:-} ]]; then
+  jq . "$OMARCHY_UPDATE_PLAN_FIXTURE"
+  exit 0
+fi
+
+pins_file=${OMARCHY_UPDATE_PINS_FILE:-/etc/omarchy/update-pins.json}
+work_dir=$(mktemp -d)
+trap 'rm -rf "$work_dir"' EXIT
+
+for category in arch omarchy aur mise; do
+  printf '[]\n' >"$work_dir/$category.json"
+done
+
+if [[ -r $pins_file ]] && jq -e 'type == "object"' "$pins_file" >/dev/null 2>&1; then
+  cp "$pins_file" "$work_dir/pins.json"
+else
+  printf '{}\n' >"$work_dir/pins.json"
+fi
+
+append_package() {
+  local category=$1 manager=$2 name=$3 installed=$4 available=$5 source=$6 requested=${7:-latest}
+  local target pinned_kind pinned_locator candidate tmp
+
+  # A mise tool's own requested version is its pin; the pins file only
+  # governs pacman-managed packages.
+  if [[ $manager == "mise" && $requested != "latest" ]]; then
+    target=$requested
+    pinned_kind=installed
+    pinned_locator=
+  else
+    target=$(jq -r --arg name "$name" '.[$name].version // "latest"' "$work_dir/pins.json")
+    pinned_kind=$(jq -r --arg name "$name" '.[$name].kind // ""' "$work_dir/pins.json")
+    pinned_locator=$(jq -r --arg name "$name" '.[$name].locator // ""' "$work_dir/pins.json")
+  fi
+  candidate=$(jq -n \
+    --arg name "$name" \
+    --arg manager "$manager" \
+    --arg installed "$installed" \
+    --arg available "$available" \
+    --arg source "$source" \
+    --arg target "$target" \
+    --arg kind "$pinned_kind" \
+    --arg locator "$pinned_locator" \
+    '{
+      name: $name,
+      manager: $manager,
+      installed: $installed,
+      available: $available,
+      source: $source,
+      selected: true,
+      target: $target,
+      candidate: (if $kind == "" then null else {version: $target, kind: $kind, locator: $locator} end)
+    }')
+  tmp="$work_dir/$category.tmp"
+  jq --argjson package "$candidate" '. + [$package]' "$work_dir/$category.json" >"$tmp"
+  mv "$tmp" "$work_dir/$category.json"
+}
+
+repo_for() {
+  LC_ALL=C pacman -Si -- "$1" 2>/dev/null | awk -F ' *: *' '$1 == "Repository" { print $2; exit }'
+}
+
+if omarchy-cmd-present checkupdates; then
+  repo_updates="$work_dir/repo-updates"
+  set +e
+  checkupdates >"$repo_updates" 2>"$work_dir/repo-error"
+  repo_status=$?
+  set -e
+  if ((repo_status != 0 && repo_status != 2)); then
+    cat "$work_dir/repo-error" >&2
+    echo "Could not build the repository update plan" >&2
+    exit 1
+  fi
+  while read -r name installed arrow available rest; do
+    [[ -n ${name:-} && $arrow == "->" ]] || continue
+    repo=$(repo_for "$name")
+    if [[ $repo == "omarchy" ]]; then
+      append_package omarchy repo "$name" "$installed" "$available" "$repo"
+    else
+      append_package arch repo "$name" "$installed" "$available" "${repo:-repository}"
+    fi
+  done <"$repo_updates"
+fi
+
+if omarchy-cmd-present yay && pacman -Qem >/dev/null 2>&1 && omarchy-pkg-aur-accessible; then
+  aur_updates="$work_dir/aur-updates"
+  set +e
+  yay -Qua >"$aur_updates" 2>"$work_dir/aur-error"
+  aur_status=$?
+  set -e
+  if ((aur_status != 0 && aur_status != 1)); then
+    cat "$work_dir/aur-error" >&2
+    echo "Could not build the AUR update plan" >&2
+    exit 1
+  fi
+  while read -r name installed arrow available rest; do
+    [[ -n ${name:-} && $arrow == "->" ]] || continue
+    append_package aur aur "$name" "$installed" "$available" AUR
+  done <"$aur_updates"
+fi
+
+if omarchy-cmd-present mise; then
+  if ! mise_json=$(mise outdated --json); then
+    echo "Could not build the mise update plan" >&2
+    exit 1
+  fi
+  mise_ls=$(mise ls --json 2>/dev/null || printf '{}')
+
+  mise_requested() {
+    jq -r --arg name "$1" '.[$name][0].requested_version // "latest"' <<<"$mise_ls" 2>/dev/null ||
+      printf 'latest'
+  }
+
+  # Pinned tools that owe nothing to their range never appear as outdated, so
+  # they are added here: the pin has to be visible to be lift-able.
+  while IFS=$'\t' read -r name installed requested; do
+    [[ -n ${name:-} ]] || continue
+    if jq -e --arg name "$name" 'has($name)' <<<"$mise_json" >/dev/null 2>&1; then
+      continue
+    fi
+    latest=$(mise latest "$name" 2>/dev/null || true)
+    [[ -n ${latest:-} ]] || continue
+    append_package mise mise "$name" "$installed" "$latest" mise "$requested"
+  done < <(jq -r '
+    to_entries[] |
+    select((.value[0].requested_version // "latest") != "latest") |
+    [.key, .value[0].version, .value[0].requested_version] |
+    @tsv
+  ' <<<"$mise_ls")
+
+  while IFS=$'\t' read -r name installed available; do
+    [[ -n ${name:-} && -n ${available:-} ]] || continue
+    append_package mise mise "$name" "$installed" "$available" mise "$(mise_requested "$name")"
+  done < <(jq -r '
+    to_entries[] |
+    [.key, (.value.current // .value.installed // "unknown"), (.value.latest // .value.bump // .value.requested // "")] |
+    @tsv
+  ' <<<"$mise_json" 2>/dev/null || true)
+fi
+
+jq -n \
+  --slurpfile arch "$work_dir/arch.json" \
+  --slurpfile omarchy "$work_dir/omarchy.json" \
+  --slurpfile aur "$work_dir/aur.json" \
+  --slurpfile mise "$work_dir/mise.json" \
+  --slurpfile pins "$work_dir/pins.json" \
+  '{
+    categories: [
+      {id: "arch", label: "Arch packages", selected: true, packages: $arch[0]},
+      {id: "omarchy", label: "Omarchy packages", selected: true, packages: $omarchy[0]},
+      {id: "aur", label: "AUR packages", selected: true, packages: $aur[0]},
+      {id: "mise", label: "mise tools", selected: true, packages: $mise[0]}
+    ],
+    originalPins: $pins[0],
+    pins: $pins[0]
+  }'

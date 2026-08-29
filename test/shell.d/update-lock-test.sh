@@ -36,6 +36,7 @@ for command in \
   pkexec \
   systemd-inhibit \
   omarchy-update-pkg-prune \
+  omarchy-update-plan \
   omarchy-update-dev \
   omarchy-update-keyring \
   omarchy-update-system-pkgs \

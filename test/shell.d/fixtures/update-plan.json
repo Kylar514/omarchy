@@ -1,0 +1,38 @@
+{
+  "categories": [
+    {
+      "id": "arch",
+      "label": "Arch packages",
+      "selected": true,
+      "packages": [
+        {"name":"linux","manager":"repo","installed":"6.17.1-1","available":"6.17.2-1","source":"core","selected":true,"target":"latest","candidate":null}
+      ]
+    },
+    {
+      "id": "omarchy",
+      "label": "Omarchy packages",
+      "selected": true,
+      "packages": [
+        {"name":"omarchy","manager":"repo","installed":"4.0.1-1","available":"4.0.2-1","source":"omarchy","selected":true,"target":"latest","candidate":null}
+      ]
+    },
+    {
+      "id": "aur",
+      "label": "AUR packages",
+      "selected": true,
+      "packages": [
+        {"name":"remote-desktop-manager","manager":"aur","installed":"2026.2.2.2-2","available":"2026.3.0.1-1","source":"AUR","selected":true,"target":"latest","candidate":null}
+      ]
+    },
+    {
+      "id": "mise",
+      "label": "mise tools",
+      "selected": true,
+      "packages": [
+        {"name":"opencode","manager":"mise","installed":"1.18.23","available":"1.19.0","source":"mise","selected":true,"target":"latest","candidate":null}
+      ]
+    }
+  ],
+  "originalPins": {},
+  "pins": {}
+}

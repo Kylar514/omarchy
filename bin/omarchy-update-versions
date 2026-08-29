@@ -1,0 +1,100 @@
+#!/bin/bash
+
+# omarchy:summary=List selectable versions for an update candidate
+# omarchy:args=<repo|aur|mise> <package> <installed-version> <latest-version> [source]
+# omarchy:hidden=true
+
+set -euo pipefail
+
+manager=${1:?usage: omarchy-update-versions <repo|aur|mise> <package> <installed-version> <latest-version>}
+package=${2:?}
+installed=${3:?}
+latest=${4:?}
+source=${5:-}
+
+if [[ ! $package =~ ^[a-zA-Z0-9@._+-]+$ ]]; then
+  echo "Invalid package name: $package" >&2
+  exit 1
+fi
+
+candidates=$(mktemp)
+trap 'rm -f "$candidates"' EXIT
+
+add_candidate() {
+  local version=$1 kind=$2 locator=${3:-}
+  printf '%s\t%s\t%s\n' "$version" "$kind" "$locator" >>"$candidates"
+}
+
+add_candidate latest latest
+[[ $installed == "$latest" ]] || add_candidate "$latest" available
+add_candidate "$installed" installed
+
+if [[ $manager == "mise" ]]; then
+  mise ls-remote "$package" 2>/dev/null | sort -Vr | while read -r version rest; do
+    [[ -n ${version:-} ]] && add_candidate "$version" mise "$version"
+  done
+else
+  while IFS= read -r cache_dir; do
+    [[ -d $cache_dir ]] || continue
+    for archive in "$cache_dir"/"$package"-*.pkg.tar.*; do
+      [[ -f $archive && $archive != *.sig ]] || continue
+      metadata=$(LC_ALL=C pacman -Qp --print-format '%n\t%v' "$archive" 2>/dev/null || true)
+      [[ ${metadata%%$'\t'*} == "$package" ]] || continue
+      add_candidate "${metadata#*$'\t'}" cache "$archive"
+    done
+  done < <(pacman-conf CacheDir 2>/dev/null)
+
+  yay_cache=${XDG_CACHE_HOME:-$HOME/.cache}/yay/$package
+  if [[ -d $yay_cache ]]; then
+    for archive in "$yay_cache"/"$package"-*.pkg.tar.*; do
+      [[ -f $archive && $archive != *.sig ]] || continue
+      metadata=$(LC_ALL=C pacman -Qp --print-format '%n\t%v' "$archive" 2>/dev/null || true)
+      [[ ${metadata%%$'\t'*} == "$package" ]] || continue
+      add_candidate "${metadata#*$'\t'}" cache "$archive"
+    done
+  fi
+
+  if [[ $manager == "aur" && ${OMARCHY_UPDATE_NO_AUR_HISTORY:-0} != 1 ]]; then
+    aur_history=$(mktemp -d)
+    if git clone --quiet --filter=blob:none "https://aur.archlinux.org/$package.git" "$aur_history" 2>/dev/null; then
+      while read -r commit; do
+        srcinfo=$(git -C "$aur_history" show "$commit:.SRCINFO" 2>/dev/null || true)
+        [[ -n $srcinfo ]] || continue
+        awk -F ' = ' -v package="$package" '$1 ~ /pkgname$/ && $2 == package { found = 1 } END { exit !found }' <<<"$srcinfo" || continue
+        pkgver=$(awk -F ' = ' '$1 ~ /pkgver$/ { print $2; exit }' <<<"$srcinfo")
+        pkgrel=$(awk -F ' = ' '$1 ~ /pkgrel$/ { print $2; exit }' <<<"$srcinfo")
+        epoch=$(awk -F ' = ' '$1 ~ /epoch$/ { print $2; exit }' <<<"$srcinfo")
+        [[ -n $pkgver && -n $pkgrel ]] || continue
+        version="$pkgver-$pkgrel"
+        [[ -z $epoch || $epoch == 0 ]] || version="$epoch:$version"
+        add_candidate "$version" recipe "$commit"
+      done < <(git -C "$aur_history" log --format=%H -n 30)
+    fi
+    rm -rf "$aur_history"
+  fi
+
+  if [[ $manager == "repo" && $source != "omarchy" && ${OMARCHY_UPDATE_NO_ARCHIVE:-0} != 1 ]]; then
+    first=${package:0:1}
+    archive_url="https://archive.archlinux.org/packages/$first/$package/"
+    curl -fsSL --max-time 10 "$archive_url" 2>/dev/null |
+      perl -nE 'while (/href="([^"?]+\.pkg\.tar\.(?:zst|xz))"/g) { say $1 }' |
+      tail -n 50 |
+      while read -r filename; do
+        [[ $filename =~ ^$package-([0-9]|[0-9]+%3A) ]] || continue
+        version=${filename#"$package"-}
+        version=${version%-x86_64.pkg.tar.zst}
+        version=${version%-x86_64.pkg.tar.xz}
+        version=${version%-any.pkg.tar.zst}
+        version=${version%-any.pkg.tar.xz}
+        version=${version//%3A/:}
+        [[ $version != "$filename" ]] || continue
+        add_candidate "$version" archive "$archive_url$filename"
+      done
+  fi
+fi
+
+awk -F '\t' '!seen[$1]++' "$candidates" |
+  jq -R -s '
+    split("\n") |
+    map(select(length > 0) | split("\t") | {version: .[0], kind: .[1], locator: (.[2] // "")})
+  '
